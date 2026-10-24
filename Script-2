@@ -1,0 +1,748 @@
+// ============================================================
+// KHYBER PAKHTUNKHWA LAKE DYNAMICS - 2025
+// Landsat 8/9 → MNDWI → LOCAL OTSU PER LAKE
+// → Reference Polygon → Lake Water Detection
+// ============================================================
+
+
+// ============================================================
+// 1. SETTINGS
+// ============================================================
+
+var analysisStart = ee.Date('2025-06-01');
+var analysisEnd   = ee.Date('2025-12-01');
+
+// IMPORTANT:
+// Use the exact spelling present in your PROVINCE field.
+var provinceName = 'KHYBER PAKHTUNKHWA';
+
+
+// ------------------------------------------------------------
+// Local Otsu neighbourhood
+// ------------------------------------------------------------
+
+var otsuBufferMeters = 1000;
+
+
+// ------------------------------------------------------------
+// Maximum allowed lake expansion
+// ------------------------------------------------------------
+
+var lakeBufferMeters = 150;
+
+
+// ------------------------------------------------------------
+// Minimum overlap with reference polygon
+// 0.09 ha ≈ one Landsat 30 m pixel
+// ------------------------------------------------------------
+
+var minOverlapHa = 0.09;
+
+
+// ============================================================
+// 2. SELECT KPK LAKES
+// ============================================================
+
+// IWMI point inventory
+var provincePoints = pakistanLakes
+  .filter(
+    ee.Filter.eq(
+      'PROVINCE',
+      provinceName
+    )
+  );
+
+
+// Reference polygon inventory
+var provincePolygons = lakesPolygons
+  .filter(
+    ee.Filter.eq(
+      'PROVINCE',
+      provinceName
+    )
+  );
+
+
+print(
+  'KPK IWMI lake points:',
+  provincePoints.size()
+);
+
+
+print(
+  'KPK reference polygons:',
+  provincePolygons.size()
+);
+
+
+// ============================================================
+// 3. PROCESSING REGION
+// ============================================================
+
+// We need a 1 km neighbourhood around each
+// reference lake for local Otsu calculation.
+
+var otsuRegion = provincePolygons
+  .map(function(lake) {
+
+    return ee.Feature(
+      lake.geometry().buffer(
+        otsuBufferMeters
+      )
+    );
+
+  })
+  .geometry();
+
+
+// We also need the lake detection zones.
+
+var detectionRegion = provincePolygons
+  .map(function(lake) {
+
+    return ee.Feature(
+      lake.geometry().buffer(
+        lakeBufferMeters
+      )
+    );
+
+  })
+  .geometry();
+
+
+var processingRegion = otsuRegion
+  .union(
+    detectionRegion,
+    1
+  );
+
+
+// ============================================================
+// 4. LANDSAT 8/9 PREPROCESSING
+// ============================================================
+
+function preprocessL89(image) {
+
+  // KEEPING YOUR ORIGINAL MASK
+  var clearMask = image
+    .select('QA_PIXEL')
+    .bitwiseAnd(31)
+    .eq(0);
+
+
+  var saturationMask = image
+    .select('QA_RADSAT')
+    .eq(0);
+
+
+  // Green
+  var green = image
+    .select('SR_B3')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+
+  // SWIR 1
+  var swir1 = image
+    .select('SR_B6')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+
+  // MNDWI
+  var mndwi = green
+    .subtract(swir1)
+    .divide(
+      green.add(swir1)
+    )
+    .rename('MNDWI');
+
+
+  return mndwi
+    .updateMask(clearMask)
+    .updateMask(saturationMask)
+    .copyProperties(
+      image,
+      ['system:time_start']
+    );
+}
+
+
+// ============================================================
+// 5. LANDSAT COLLECTION
+// ============================================================
+
+var landsat8 = ee.ImageCollection(
+  'LANDSAT/LC08/C02/T1_L2'
+)
+  .filterBounds(
+    processingRegion
+  )
+  .filterDate(
+    analysisStart,
+    analysisEnd
+  );
+
+
+var landsat9 = ee.ImageCollection(
+  'LANDSAT/LC09/C02/T1_L2'
+)
+  .filterBounds(
+    processingRegion
+  )
+  .filterDate(
+    analysisStart,
+    analysisEnd
+  );
+
+
+var landsat = landsat8
+  .merge(landsat9)
+  .map(
+    preprocessL89
+  );
+
+
+print(
+  'Landsat images:',
+  landsat.size()
+);
+
+
+// ============================================================
+// 6. MEDIAN MNDWI
+// ============================================================
+
+var medianMNDWI = landsat
+  .median()
+  .clip(
+    processingRegion
+  );
+
+
+// ============================================================
+// 7. OTSU FUNCTION
+// ============================================================
+
+function otsu(histogram) {
+
+  histogram = ee.Dictionary(
+    histogram
+  );
+
+
+  var counts = ee.Array(
+    histogram.get('histogram')
+  );
+
+
+  var means = ee.Array(
+    histogram.get('bucketMeans')
+  );
+
+
+  var size = ee.Number(
+    means.length().get([0])
+  );
+
+
+  var total = ee.Number(
+    counts
+      .reduce(
+        ee.Reducer.sum(),
+        [0]
+      )
+      .get([0])
+  );
+
+
+  var sum = ee.Number(
+    means
+      .multiply(counts)
+      .reduce(
+        ee.Reducer.sum(),
+        [0]
+      )
+      .get([0])
+  );
+
+
+  var mean = sum.divide(
+    total
+  );
+
+
+  var indices = ee.List.sequence(
+    1,
+    size.subtract(1)
+  );
+
+
+  var bss = indices.map(
+    function(i) {
+
+      i = ee.Number(i);
+
+
+      var aCounts = counts.slice(
+        0,
+        0,
+        i
+      );
+
+
+      var aCount = ee.Number(
+        aCounts
+          .reduce(
+            ee.Reducer.sum(),
+            [0]
+          )
+          .get([0])
+      );
+
+
+      var aMeans = means.slice(
+        0,
+        0,
+        i
+      );
+
+
+      var aSum = ee.Number(
+        aMeans
+          .multiply(aCounts)
+          .reduce(
+            ee.Reducer.sum(),
+            [0]
+          )
+          .get([0])
+      );
+
+
+      var aMean = aSum.divide(
+        aCount
+      );
+
+
+      var bCount = total.subtract(
+        aCount
+      );
+
+
+      var bMean = sum
+        .subtract(aSum)
+        .divide(
+          bCount
+        );
+
+
+      return aCount
+        .multiply(
+          aMean
+            .subtract(mean)
+            .pow(2)
+        )
+        .add(
+          bCount.multiply(
+            bMean
+              .subtract(mean)
+              .pow(2)
+          )
+        );
+
+    }
+  );
+
+
+  var bssArray = ee.Array(
+    bss
+  );
+
+
+  var candidateMeans = means.slice(
+    0,
+    0,
+    size.subtract(1)
+  );
+
+
+  return ee.Number(
+    candidateMeans
+      .sort(bssArray)
+      .get([-1])
+  );
+}
+
+
+// ============================================================
+// 8. LAKE WATER DETECTION FUNCTION
+// ============================================================
+
+function detectLakeWater(lake) {
+
+  var referenceGeometry =
+    lake.geometry();
+
+
+  // ==========================================================
+  // LOCAL OTSU REGION
+  // ==========================================================
+
+  var otsuZone =
+    referenceGeometry.buffer(
+      otsuBufferMeters
+    );
+
+
+  // ==========================================================
+  // LOCAL HISTOGRAM
+  // ==========================================================
+
+  var histogram =
+    medianMNDWI.reduceRegion({
+
+      reducer:
+        ee.Reducer.histogram({
+
+          maxBuckets:
+            128,
+
+          minBucketWidth:
+            0.005
+
+        }),
+
+      geometry:
+        otsuZone,
+
+      scale:
+        90,
+
+      bestEffort:
+        true,
+
+      maxPixels:
+        1e8,
+
+      tileScale:
+        8
+
+    });
+
+
+  // ==========================================================
+  // LOCAL OTSU THRESHOLD
+  // ==========================================================
+
+  var localOtsuThreshold =
+    otsu(
+      histogram.get('MNDWI')
+    );
+
+
+  // ==========================================================
+  // LAKE DETECTION ZONE
+  // ==========================================================
+
+  var lakeZone =
+    referenceGeometry.buffer(
+      lakeBufferMeters
+    );
+
+
+  // ==========================================================
+  // LOCAL WATER MASK
+  // ==========================================================
+
+  var localWater =
+    medianMNDWI
+      .gt(
+        localOtsuThreshold
+      )
+      .selfMask()
+      .rename('water')
+      .toByte()
+      .clip(
+        lakeZone
+      );
+
+
+  // ==========================================================
+  // VECTORIZE WATER
+  // ==========================================================
+
+  var waterPolygons =
+    localWater.reduceToVectors({
+
+      geometry:
+        lakeZone,
+
+      scale:
+        30,
+
+      geometryType:
+        'polygon',
+
+      eightConnected:
+        true,
+
+      labelProperty:
+        'water',
+
+      reducer:
+        ee.Reducer.countEvery(),
+
+      maxPixels:
+        1e8,
+
+      tileScale:
+        4
+
+    });
+
+
+  // ==========================================================
+  // ONLY COMPONENTS TOUCHING REFERENCE POLYGON
+  // ==========================================================
+
+  var candidateWater =
+    waterPolygons.filterBounds(
+      referenceGeometry
+    );
+
+
+  // ==========================================================
+  // CALCULATE OVERLAP WITH REFERENCE POLYGON
+  // ==========================================================
+
+  var waterWithOverlap =
+    candidateWater.map(
+      function(feature) {
+
+        var overlapHa =
+          feature.geometry()
+            .intersection(
+              referenceGeometry,
+              1
+            )
+            .area(1)
+            .divide(10000);
+
+
+        return feature.set(
+          'overlap_ha',
+          overlapHa
+        );
+
+      }
+    );
+
+
+  // ==========================================================
+  // SELECT VALID WATER COMPONENTS
+  // ==========================================================
+
+  var selectedWater =
+    waterWithOverlap.filter(
+      ee.Filter.gte(
+        'overlap_ha',
+        minOverlapHa
+      )
+    );
+
+
+  // ==========================================================
+  // MERGE ACCEPTED COMPONENTS
+  // ==========================================================
+
+  var detectedGeometry =
+    selectedWater.geometry();
+
+
+  // ==========================================================
+  // RETURN LAKE
+  // ==========================================================
+
+  return ee.Feature(
+    detectedGeometry
+  )
+    .copyProperties(
+      lake
+    )
+    .set({
+
+      'Water_Parts':
+        selectedWater.size(),
+
+      'Buffer_m':
+        lakeBufferMeters,
+
+      'Otsu_Buffer_m':
+        otsuBufferMeters,
+
+      'Local_Otsu':
+        localOtsuThreshold
+
+    });
+
+}
+
+
+// ============================================================
+// 9. APPLY LOCAL DETECTION TO ALL KPK LAKES
+// ============================================================
+
+var detectedProvinceLakes =
+  provincePolygons.map(
+    detectLakeWater
+  );
+
+
+print(
+  'Detected KPK lakes:',
+  detectedProvinceLakes.size()
+);
+
+
+// ============================================================
+// 10. VIEW LOCAL OTSU VALUES
+// ============================================================
+
+print(
+  'KPK lakes with local Otsu:',
+  detectedProvinceLakes
+    .select([
+      'Local_Otsu',
+      'Water_Parts',
+      'Buffer_m'
+    ])
+);
+
+
+// ============================================================
+// 11. MAP DISPLAY
+// ============================================================
+
+Map.centerObject(
+  provincePolygons,
+  7
+);
+
+
+// ------------------------------------------------------------
+// Reference polygons
+// ------------------------------------------------------------
+
+Map.addLayer(
+
+  provincePolygons.style({
+
+    color:
+      'FF00FF',
+
+    fillColor:
+      '00000000',
+
+    width:
+      2
+
+  }),
+
+  {},
+
+  'KPK Reference Lake Polygons'
+
+);
+
+
+// ------------------------------------------------------------
+// Detected lake water
+// ------------------------------------------------------------
+
+Map.addLayer(
+
+  detectedProvinceLakes.style({
+
+    color:
+      '00BFFF',
+
+    fillColor:
+      '00BFFF',
+
+    width:
+      1
+
+  }),
+
+  {},
+
+  'Detected KPK Lake Water'
+
+);
+
+
+// ------------------------------------------------------------
+// Median MNDWI
+// ------------------------------------------------------------
+
+Map.addLayer(
+
+  medianMNDWI,
+
+  {
+
+    min:
+      -0.5,
+
+    max:
+      0.5,
+
+    palette:
+      [
+        '8c510a',
+        'd8b365',
+        'f6e8c3',
+        'c7eae5',
+        '5ab4ac',
+        '01665e'
+      ]
+
+  },
+
+  'KPK Median MNDWI',
+
+  false
+
+);
+// ============================================================
+// 10. CALCULATE LAKE AREA
+// ============================================================
+
+var lakeAreaResults = detectedProvinceLakes.map(function(lake) {
+
+  var areaHa = lake.geometry()
+    .area(1)
+    .divide(10000);
+
+  var areaAcres = areaHa
+    .multiply(2.47105);
+
+  return lake.set({
+
+    'Area_ha_2025': areaHa,
+
+    'Area_acres_2025': areaAcres
+
+  });
+
+});
+
+
+print(
+  'KPK Lake Areas - 2025:',
+  lakeAreaResults
+    .select([
+      'Area_ha_2025',
+      'Area_acres_2025'
+    ])
+);
