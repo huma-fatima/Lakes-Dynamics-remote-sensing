@@ -1,1 +1,80 @@
+// =========================================================================
+// REGION OF INTEREST (ROI) & DATE FILTER
+// =========================================================================
+var roi = ee.Geometry.Polygon([
+  [[73.0, 35.0], [77.0, 35.0], [77.0, 37.0], [73.0, 37.0]]
+]); // Northern Pakistan / Alpine region
 
+Map.centerObject(roi, 9);
+
+// =========================================================================
+// 1. DEM, SLOPE & HILLSHADE MASKING (Eliminates Mountain & Terrain Shadows)
+// =========================================================================
+var dem = ee.Image("USGS/SRTMGL1_003").clip(roi);
+var slope = ee.Terrain.slope(dem);
+
+// Lakes form on flat terrain; restrict water detection to slopes under 5 degrees
+var flatTerrainMask = slope.lt(5);
+
+// Compute hillshade to eliminate deep mountain/cliff shadows
+// Using approximate summer sun angles for Northern Pakistan (Azimuth: 150°, Elevation: 60°)
+var hillshade = ee.Terrain.hillshade(dem, 150, 60);
+
+// Exclude deep shadow pixels (hillshade values below 20 represent dark cliffs/shadows)
+var shadowMask = hillshade.gt(20); 
+
+// =========================================================================
+// 2. CLOUD, SHADOW & SNOW MASKING (Sentinel-2 SR)
+// =========================================================================
+function maskSentinel2SR(image) {
+  var scl = image.select('SCL');
+  
+  // SCL Classes: 3 = Cloud shadows, 8-10 = Clouds, 11 = Snow/Ice
+  var validMask = scl.neq(3)
+                     .and(scl.neq(8))
+                     .and(scl.neq(9))
+                     .and(scl.neq(10))
+                     .and(scl.neq(11));
+  
+  return image.updateMask(validMask)
+              .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'],
+                      ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'])
+              .multiply(0.0001); // Scale factor
+}
+
+// Load Sentinel-2 Collection
+var collection = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(roi)
+  .filterDate('2025-06-01', '2025-10-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(maskSentinel2SR);
+
+// PRINT NUMBER OF IMAGES IN COLLECTION TO CONSOLE
+print('Total filtered Sentinel-2 images in collection:', collection.size());
+
+// =========================================================================
+// 3. SEASONAL COMPOSITE & WATER EXTRACTION
+// =========================================================================
+var seasonalComposite = collection.median().clip(roi);
+
+var mndwi = seasonalComposite.normalizedDifference(['green', 'swir1']).rename('MNDWI');
+var ndvi = seasonalComposite.normalizedDifference(['nir', 'red']).rename('NDVI');
+
+// Strict Water Rule: MNDWI > 0.1, MNDWI > NDVI, Flat Terrain, AND No Mountain Shadows
+var waterMask = mndwi.gt(0.1)
+                   .and(mndwi.gt(ndvi))
+                   .and(flatTerrainMask)
+                   .and(shadowMask);
+
+// =========================================================================
+// 4. MAP VISUALIZATION
+// =========================================================================
+var rgbVis = {
+  bands: ['red', 'green', 'blue'], 
+  min: 0.0, 
+  max: 0.3
+};
+
+Map.addLayer(seasonalComposite, rgbVis, 'Sentinel-2 RGB Composite');
+Map.addLayer(hillshade, {min: 0, max: 255}, 'DEM Hillshade', false); // Optional: view hillshade layer
+Map.addLayer(waterMask.updateMask(waterMask), {palette: ['blue']}, 'Clean Extracted Water Bodies');
